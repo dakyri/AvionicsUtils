@@ -1,20 +1,13 @@
 package com.openavionics.utils.file;
 
-// Wav file IO class
-// A.Greensted
-// http://www.labbookpages.co.uk
-
-// File format is based on the information from
-// http://www.sonicspot.com/guide/wavefiles.html
-// http://www.blitter.com/~russtopia/MIDI/~jglatt/tech/wave.htm
-
-// Version 1.0
-
-// modified to add short reads 
+/**
+ * wave file wrapper grabbed from the mayaswellCore audio lib. Copied directly to avoid the jni dependencies of that lib.
+ */
 
 import java.io.*;
 import java.nio.channels.FileChannel;
 
+import android.os.Parcelable;
 import android.util.Log;
 
 public class WavFile implements AudioFile
@@ -25,6 +18,30 @@ public class WavFile implements AudioFile
 	private final static int DATA_CHUNK_ID = 0x61746164;
 	private final static int RIFF_CHUNK_ID = 0x46464952;
 	private final static int RIFF_TYPE_ID = 0x45564157;
+
+	public final static int WAV_FORMAT_PCM = 0x0001; 			// PCM
+	public final static int WAV_FORMAT_IEEE_FLOAT = 0x0003;	// IEEE float
+	public final static int WAV_FORMAT_ALAW = 0x0006;			// 8-bit ITU-T G.711 A-law
+	public final static int WAV_FORMAT_MULAW = 0x0007;		// 8-bit ITU-T G.711 µ-law
+	public final static int WAV_FORMAT_EXTENSIBLE = 0xFFFE;	// Determined by SubFormat
+/*
+PCM Format
+
+The first part of the Format chunk is used to describe PCM data.
+    For PCM data, the Format chunk in the header declares the number of bits/sample in each sample (wBitsPerSample).
+	The original documentation (Revision 1) specified that the number of bits per sample is to be rounded up to the next multiple of 8 bits.
+	This rounded-up value is the container size. This information is redundant in that the container size (in bytes)
+	for each sample can also be determined from the block size divided by the number of channels (nBlockAlign / nChannels).
+	This redundancy has been appropriated to define new formats. For instance, Cool Edit uses a format which declares a sample size of 24 bits together with a container size of 4 bytes (32 bits) determined from the block size and number of channels. With this combination, the data is actually stored as 32-bit IEEE floats. The normalization (full scale 223) is however different from the standard float format.
+    PCM data is two's-complement except for resolutions of 1-8 bits, which are represented as offset binary.
+
+Non-PCM Formats
+An extended Format chunk is used for non-PCM data. The cbSize field gives the size of the extension.
+    For all formats other than PCM, the Format chunk must have an extended portion. The extension can be of zero length, but the size field (with value 0) must be present.
+    For float data, full scale is 1. The bits/sample would normally be 32 or 64.
+    For the log-PCM formats (µ-law and A-law), the Rev. 3 documentation indicates that the bits/sample field (wBitsPerSample) should be set to 8 bits.
+    The non-PCM formats must have a fact chunk.
+*/
 
 	private File file;						// File that will be read from or written to
 	private IOState ioState;				// Specifies the IO State of the Wav File (used for snaity checking)
@@ -42,6 +59,7 @@ public class WavFile implements AudioFile
 													// Although a java int is 4 bytes, it is signed, so need to use a long
 	private int blockAlign;					// 2 bytes unsigned, 0x0001 (1) to 0xFFFF (65,535)
 	private int validBits;					// 2 bytes unsigned, 0x0002 (2) to 0xFFFF (65,535)
+	private int format;						// one of the WAVE_FORMAT.. constants
 
 	// Buffering
 	private byte[] buffer;					// Local buffer used for IO
@@ -51,7 +69,9 @@ public class WavFile implements AudioFile
 	
 	private long dataStart;
 
-	// Cannot instantiate WavFile directly, must either use create() or open()
+	/**
+	 * 	Don't instantiate WavFile directly, must either use create() or open()
+	 */
 	public WavFile()
 	{
 		buffer = new byte[BUFFER_SIZE];
@@ -94,7 +114,11 @@ public class WavFile implements AudioFile
 		return validBits;
 	}
 
-	public void create(File file, int numChannels, long numFrames, int validBits, long sampleRate) throws IOException, AudioFileException
+	public void create(File file, int numChannels, long numFrames, int validBits, long sampleRate) throws IOException, AudioFileException {
+		create(file, numChannels, numFrames, validBits, sampleRate, WAV_FORMAT_PCM);
+	}
+
+	public void create(File file, int numChannels, long numFrames, int validBits, long sampleRate, int format) throws IOException, AudioFileException
 	{
 		if (ioState != IOState.CLOSED) {
 			close();
@@ -107,6 +131,7 @@ public class WavFile implements AudioFile
 		this.bytesPerSample = (validBits + 7) / 8;
 		this.blockAlign = this.bytesPerSample * numChannels;
 		this.validBits = validBits;
+		this.format = format;
 
 		// Sanity check arguments
 		if (numChannels < 1 || numChannels > 65535) throw new AudioFileException("Illegal number of channels, valid range 1 to 65536");
@@ -166,25 +191,40 @@ public class WavFile implements AudioFile
 
 		// Write out the header
 		wavFile.oStream.write(wavFile.buffer, 0, 12);
+/*
+fact Chunk
 
+All (compressed) non-PCM formats must have a fact chunk (Rev. 3 documentation).
+The chunk contains at least one value, the number of samples in the file.
+Field 	Length 	Contents
+ckID 	4 	Chunk ID: "fact"
+cksize 	4 	Chunk size: minimum 4
+dwSampleLength 	4 	Number of samples (per channel)
+
+The Rev. 3 documentation states that the Fact chunk "is required for all new new WAVE formats",
+but "is not required" for the standard WAVE_FORMAT_PCM file.
+One presumes that files with IEEE float data (introduced after the Rev. 3 documention) need a fact chunk.
+*/
 		// Put format data in buffer
 		long averageBytesPerSecond = wavFile.sampleRate * wavFile.blockAlign;
 
-		putLE(FMT_CHUNK_ID,				wavFile.buffer, 0, 4);		// Chunk ID
-		putLE(16,							wavFile.buffer, 4, 4);		// Chunk Data Size
-		putLE(1,								wavFile.buffer, 8, 2);		// Compression Code (Uncompressed)
-		putLE(wavFile.numChannels,				wavFile.buffer, 10, 2);		// Number of channels
-		putLE(wavFile.sampleRate,					wavFile.buffer, 12, 4);		// Sample Rate
-		putLE(averageBytesPerSecond,	wavFile.buffer, 16, 4);		// Average Bytes Per Second
-		putLE(wavFile.blockAlign,		wavFile.buffer, 20, 2);		// Block Align
-		putLE(wavFile.validBits,					wavFile.buffer, 22, 2);		// Valid Bits
-
-		// Write Format Chunk
-		wavFile.oStream.write(wavFile.buffer, 0, 24);
+		int wavFormatChunkLen = (wavFile.format == WAV_FORMAT_PCM)? 16 : 18;
+		putLE(FMT_CHUNK_ID, wavFile.buffer, 0, 4);        // Chunk ID
+		putLE(wavFormatChunkLen, wavFile.buffer, 4, 4);        			// Chunk Data Size
+		putLE(wavFile.format, wavFile.buffer, 8, 2);        // Compression Code (Uncompressed)
+		putLE(wavFile.numChannels, wavFile.buffer, 10, 2);	// Number of channels
+		putLE(wavFile.sampleRate, wavFile.buffer, 12, 4);	// Sample Rate
+		putLE(averageBytesPerSecond, wavFile.buffer, 16, 4);	// Average Bytes Per Second
+		putLE(wavFile.blockAlign, wavFile.buffer, 20, 2);	// Block Align
+		putLE(wavFile.validBits, wavFile.buffer, 22, 2);	// Valid Bits
+		if (wavFile.format != WAV_FORMAT_PCM) {
+			putLE(0, wavFile.buffer, 24, 2);
+		}
+		wavFile.oStream.write(wavFile.buffer, 0, 8 + wavFormatChunkLen);
 
 		// Start Data Chunk
-		putLE(DATA_CHUNK_ID,				wavFile.buffer, 0, 4);		// Chunk ID
-		putLE(dataChunkSize,				wavFile.buffer, 4, 4);		// Chunk Data Size
+		putLE(DATA_CHUNK_ID, wavFile.buffer, 0, 4);		// Chunk ID
+		putLE(dataChunkSize, wavFile.buffer, 4, 4);		// Chunk Data Size
 
 		// Write Format Chunk
 		wavFile.oStream.write(wavFile.buffer, 0, 8);
@@ -247,8 +287,10 @@ public class WavFile implements AudioFile
 				bytesRead = iStream.read(buffer, 0, 16);
 
 				// Check this is uncompressed data
-				int compressionCode = (int) getLE(buffer, 0, 2);
-				if (compressionCode != 1) throw new AudioFileException("Compression Code " + compressionCode + " not supported");
+				format = (int) getLE(buffer, 0, 2);
+				if (format != WAV_FORMAT_PCM && format != WAV_FORMAT_IEEE_FLOAT) {
+					throw new AudioFileException("Wav format " + format + " not supported");
+				}
 
 				// Extract the format information
 				numChannels = (int) getLE(buffer, 2, 2);
@@ -377,6 +419,13 @@ public class WavFile implements AudioFile
 		return val;
 	}
 
+	/**
+	 * Put little endian data from local buffer
+	 * @param buffer
+	 * @param pos
+	 * @param numBytes
+	 * @return
+	 */
 	private static void putLE(long val, byte[] buffer, int pos, int numBytes)
 	{
 		for (int b=0 ; b<numBytes ; b++)
@@ -387,8 +436,10 @@ public class WavFile implements AudioFile
 		}
 	}
 
+	/////////////////////////////////////////////////////////////////////////////
 	// Sample Writing and Reading
-	// --------------------------
+	////////////////////////////////////////////////////////////////////////////
+
 	private void writeSample(long val) throws IOException
 	{
 		for (int b=0 ; b<bytesPerSample ; b++) {
@@ -401,6 +452,11 @@ public class WavFile implements AudioFile
 			val >>= 8;
 			bufferPointer ++;
 		}
+	}
+
+	private void writeSampleF(float value) throws IOException
+	{
+		writeSample(Float.floatToRawIntBits(value));
 	}
 
 	private long readSample() throws IOException, AudioFileException
@@ -425,8 +481,15 @@ public class WavFile implements AudioFile
 		return val;
 	}
 
+	private float readSampleF() throws IOException, AudioFileException {
+		return Float.intBitsToFloat((int)readSample());
+	}
+
+
+	///////////////////////////////////////////////////////
 	// Short
-	// -------
+	//////////////////////////////////////////////////////
+
 	public int readFrames(short[] sampleBuffer, int numFramesToRead) throws IOException, AudioFileException
 	{
 		return readFrames(sampleBuffer, 0, numFramesToRead);
@@ -474,9 +537,11 @@ public class WavFile implements AudioFile
 
 		return numFramesToWrite;
 	}
-
-	// Float
-	// ------
+	/************************************************
+	 * Float
+	 * for the moment, these are the only versions
+	 * checking for WAV_FORMAT_FLOAT
+	 ************************************************/
 	public int readFrames(float[] sampleBuffer, int numFramesToRead) throws IOException, AudioFileException
 	{
 		return readFrames(sampleBuffer, 0, numFramesToRead);
@@ -485,25 +550,59 @@ public class WavFile implements AudioFile
 	public int readFrames(float[] sampleBuffer, int offset, int numFramesToRead) throws IOException, AudioFileException
 	{
 		if (ioState != IOState.READING) throw new IOException("Cannot read from WavFile instance");
-		for (int f=0 ; f<numFramesToRead ; f++)	{
-			if (frameCounter == numFrames) return f;
-			for (int c=0 ; c<numChannels ; c++)	{
-				sampleBuffer[offset] = (float) (doubleOffset + (double) readSample() / doubleScale);
-				offset ++;
+		if (format == WAV_FORMAT_PCM) {
+			for (int f=0 ; f<numFramesToRead ; f++)	{
+				if (frameCounter == numFrames) return f;
+				for (int c=0 ; c<numChannels ; c++)	{
+					sampleBuffer[offset] = readSampleF();
+					offset ++;
+				}
+				frameCounter ++;
 			}
-			frameCounter ++;
+		} else if (format == WAV_FORMAT_IEEE_FLOAT) {
+			for (int f=0 ; f<numFramesToRead ; f++)	{
+				if (frameCounter == numFrames) return f;
+				for (int c=0 ; c<numChannels ; c++)	{
+					sampleBuffer[offset] = (float) (doubleOffset + (double) readSample() / doubleScale);
+					offset ++;
+				}
+				frameCounter ++;
+			}
 		}
 		return numFramesToRead;
 	}
 
 	@Override
 	public int writeFrames(float[] sampleBuffer, int numFramesToWrite) throws IOException, AudioFileException {
-		throw new AudioFileException("Write float unimplemented");
+		return writeFrames(sampleBuffer, 0, numFramesToWrite);
 	}
 
 	@Override
 	public int writeFrames(float[] sampleBuffer, int offset, int numFramesToWrite) throws IOException, AudioFileException {
-		throw new AudioFileException("Write float unimplemented");
+		if (ioState != IOState.WRITING) throw new IOException("Cannot write to WavFile instance");
+
+		if (format == WAV_FORMAT_PCM) {
+			for (int f = 0; f < numFramesToWrite; f++) {
+				if (frameCounter == numFrames) return f;
+
+				for (int c = 0; c < numChannels; c++) {
+					writeSample((long) (doubleScale * (doubleOffset + sampleBuffer[offset])));
+					offset++;
+				}
+				frameCounter++;
+			}
+		} else if (format == WAV_FORMAT_IEEE_FLOAT) {
+			for (int f = 0; f < numFramesToWrite; f++) {
+				if (frameCounter == numFrames) return f;
+
+				for (int c = 0; c < numChannels; c++) {
+					writeSampleF(sampleBuffer[offset]);
+					offset++;
+				}
+				frameCounter++;
+			}
+		}
+		return numFramesToWrite;
 	}
 	
 	// Integer
